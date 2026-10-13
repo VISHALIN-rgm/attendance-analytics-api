@@ -1,0 +1,29 @@
+# REVIEW.md
+
+Defects found in the starter `app/main.py`. All are fixed in the current file.
+
+| # | Where | What is wrong | How you'd notice it | How I fixed it |
+|---|---|---|---|---|
+| 1 | `GET /health` | Always returns 200, never talks to MongoDB. | Stop MongoDB: `/health` still says `ok`. | `ping` the server; 503 on failure. |
+| 2 | startup (no indexes) | No index is ever created. Duplicate guarantees rely on app code, and every list/analytics query is a collection scan. | `explain` shows `COLLSCAN`; slow at 100k docs. | `ensure_indexes()` in the lifespan hook, idempotent (see DECISIONS.md). |
+| 3 | `EmployeeIn` | No validation: any `emp_code` format, bad e-mail, `shift_start == shift_end`, `joined_on: "yesterday"`, empty names, shift as `"9:5"`. Client could also pass anything for dates. | `POST /employees` with `joined_on="2026-02-30"` returns 201. | Pydantic patterns / lengths, real-date check, start != end -> 422. |
+| 4 | `create_employee` | Check-then-insert race: two parallel creates can both pass `find_one` and both insert. | Fire 20 parallel POSTs, count 201s. | Unique index on `emp_code`; `DuplicateKeyError` -> 409. |
+| 5 | `create_employee` | `created_at = datetime.now()` is naive server-local time, not UTC; response returns a datetime (ISO string), not epoch ms. | Run on a non-UTC host; compare `created_at` with the contract. | `datetime.now(UTC)`, stored as BSON date, returned as epoch ms. |
+| 6 | `list_employees` | `skip = page * page_size`: page 1 skips the first page. | Create 3 employees, `GET /employees` returns none of them. | `skip = (page - 1) * page_size`. |
+| 7 | `list_employees` | `total` is `count_documents({})`, ignoring the department filter. | `?department=X` shows total of the whole collection. | Count with the same filter `q`. |
+| 8 | `list_employees` | No sort (contract: `emp_code` asc), no bounds on `page` / `page_size` (0, negative, 10**6), returns naive datetimes. | `page=0`, `page_size=100000`. | Sort by `emp_code`; `page>=1`, `1<=page_size<=100` (422); epoch ms. |
+| 9 | `punch_in` | Unknown employee: `emp` is `None`, `emp["shift_start"]` raises `TypeError` -> 500. | Punch in with an unknown `emp_code`. | 404. |
+| 10 | `punch_in` | Time handling: `datetime.fromtimestamp(ms/1000)` and `datetime.now()` are naive server-local time, so the date and lateness depend on the host's time zone; date is not the IST date (R1); overnight shifts ignored; no truncation to whole seconds. | Run with `TZ=UTC`, punch in 09:00 IST: date is wrong near midnight, late is wrong. | UTC-aware instants, IST attendance date per R1 incl. overnight rule, truncated to seconds. |
+| 11 | `punch_in` / `PunchInIn` | `punched_at` is unvalidated: seconds (`1783312500`), floats, strings, `true` are accepted; `0` is falsy so it silently becomes "now". | Send `punched_at: 1783312500`. | `StrictInt` in 1e11..4.1e12; `is not None` check. |
+| 12 | `punch_in` / `PunchInIn` | `status` is any string: `ABSENT`, `"banana"` accepted. | `status: "ABSENT"` returns 201. | `Literal["PRESENT","WFH","ON_DUTY"]`. |
+| 13 | `punch_in` | Check-then-insert race on (emp_code, date): two simultaneous requests both pass `find_one`. | Parallel punch-ins -> two 201s, two documents. | Unique index (emp_code, date); `DuplicateKeyError` -> 409. |
+| 14 | `punch_in` response | Returns `id` (the `_id`) and raw datetimes; contract forbids `_id` and wants epoch ms. | Look at the 201 body. | `serialize_record()`. |
+| 15 | `compute_late_minutes` | `replace(hour, minute)` on a naive/UTC datetime builds "shift start" in the wrong zone; `int(x/60)` floors *before* the `> 10` test, so 09:40:30 gives 10 -> returns 0 instead of 10 (R2 is strictly more than 10:00 *in seconds*); overnight not handled. | 09:40:01 for 09:30 should be 10, starter gives 0. | Compare in seconds against IST shift start (`> 600`), then floor to minutes; overnight-aware `shift_bounds()`. |
+| 16 | `compute_work_hours` | `round(float, 2)` is banker's rounding on a binary float; 0.005 -> 0.0 and values like 2.675 round the wrong way; input not truncated to seconds. | 18 seconds of work should be 0.01 h. | Integer seconds, `Decimal`, `ROUND_HALF_UP`. |
+| 17 | `compute_overtime` | No 30-minute minimum (R3); `tzinfo=IST` mixed with a naive `punch_out` raises `TypeError`; builds shift end on `date_str` so overnight shifts give hugely negative/zero values. | Punch-out 5 min after shift end shows 5. Overnight punch-out 500. | `shift_bounds()` (end on next day for overnight), floor minutes, `>= 30` else 0. |
+| 18 | `list_attendance` | `list(db.find(q))` loads every matching document, then sorts and slices in Python. | 100k docs: seconds and memory, `explain` has no index. | Database-side `sort` / `skip` / `limit` + `count_documents`. |
+| 19 | `list_attendance` | Sort only by `date`, and in the wrong tie order (contract: `date` desc then `emp_code` asc); `page=0` makes a negative slice start; `page_size` unbounded. | Same-day records come back in arbitrary order. | Sort `[(date,-1),(emp_code,1)]`, validated paging. |
+| 20 | `list_attendance` | `date_from > date_to` not rejected, dates and `status` not validated; `_id` renamed to `id` and returned; datetimes not converted; legacy documents without `history` / `half_day` come out without those fields. | `date_from=garbage`; look at items. | Strict date parsing (422), `Literal` status, `serialize_record()` with defaults. |
+| 21 | whole file | Missing endpoints (punch-out, PATCH, analytics, explain). | Contract check. | Implemented. |
+
+**Looked at and not a defect:** `IST = timezone(timedelta(hours=5, minutes=30))` is correct; `load_dotenv()` does not override real environment variables (default `override=False`), which is what the contract needs; status code 201 on the two POSTs is correct; excluding `_id` with a projection in `list_employees` is fine; `punch_in` storing `punch_out: None` and `history: []` matches the data model.
